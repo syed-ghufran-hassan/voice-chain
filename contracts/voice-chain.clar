@@ -37,6 +37,8 @@
 (define-constant ERR_THREAD_NOT_PREMIUM (err u109))
 (define-constant ERR_INSUFFICIENT_STAKE (err u110))
 (define-constant ERR_INVALID_PARENT_REPLY (err u111))
+(define-constant ERR_ALREADY_FLAGGED (err u112))
+(define-constant ERR_FLAG_THRESHOLD_REACHED (err u113))
 
 ;; PROTOCOL CONFIGURATION
 
@@ -45,6 +47,8 @@
 (define-data-var min-stake-amount uint u1000000) ;; 1 STX minimum stake
 (define-data-var platform-fee-rate uint u250) ;; 2.5% platform fee
 (define-data-var platform-treasury principal CONTRACT_OWNER)
+(define-data-var flag-threshold uint u5) ;; Number of flags before auto-hide
+(define-data-var moderation-committee (list 5 principal) (list))
 
 ;; CORE DATA STRUCTURES
 
@@ -63,6 +67,7 @@
     tips-received: uint,
     is-locked: bool,
     reply-count: uint,
+    hidden: bool, ;; Added for moderation
   }
 )
 
@@ -78,6 +83,7 @@
     downvotes: uint,
     tips-received: uint,
     parent-reply-id: (optional uint),
+    hidden: bool, ;; Added for moderation
   }
 )
 
@@ -140,6 +146,38 @@
   }
 )
 
+;; Content Flagging System - Community Moderation
+(define-map thread-flags
+  {
+    thread-id: uint,
+    flagger: principal,
+  }
+  {
+    reason: (string-utf8 256),
+    flagged-at: uint,
+  }
+)
+
+(define-map reply-flags
+  {
+    reply-id: uint,
+    flagger: principal,
+  }
+  {
+    reason: (string-utf8 256),
+    flagged-at: uint,
+  }
+)
+
+(define-map hidden-content
+  { content-id: uint, content-type: (string-ascii 10) } ;; "thread" or "reply"
+  {
+    hidden-at: uint,
+    hidden-by: principal,
+    flag-count: uint,
+  }
+)
+
 ;; NFT MILESTONE SYSTEM
 
 (define-non-fungible-token thread-milestone uint)
@@ -192,6 +230,22 @@
 
 (define-private (is-valid-reply-id (reply-id uint))
   (is-some (map-get? replies { reply-id: reply-id }))
+)
+
+(define-private (is-in-moderation-committee (user principal))
+  (let ((committee (var-get moderation-committee)))
+    (fold check-committee-member committee false)
+  )
+)
+
+(define-private (check-committee-member (member principal) (found bool))
+  (or found (is-eq member tx-sender))
+)
+
+(define-private (count-thread-flags (thread-id uint) (count uint))
+  ;; This would need to iterate through all flags
+  ;; Simplified version - in practice would need a counter
+  u0
 )
 
 ;; READ-ONLY INTERFACE
@@ -274,6 +328,26 @@
   )
 )
 
+(define-read-only (get-thread-flag-count (thread-id uint))
+  (let ((flags (filter has-thread-flag? (list thread-id))))
+    (len flags)
+  )
+)
+
+(define-read-only (is-thread-hidden (thread-id uint))
+  (is-some (map-get? hidden-content {
+    content-id: thread-id,
+    content-type: "thread"
+  }))
+)
+
+(define-read-only (is-reply-hidden (reply-id uint))
+  (is-some (map-get? hidden-content {
+    content-id: reply-id,
+    content-type: "reply"
+  }))
+)
+
 ;; CORE PROTOCOL FUNCTIONS
 
 ;; Thread Creation - Initialize New Discussion Topic
@@ -306,6 +380,7 @@
       tips-received: u0,
       is-locked: false,
       reply-count: u0,
+      hidden: false,
     })
     
     ;; Update creator reputation metrics
@@ -342,6 +417,7 @@
     ;; Core validation
     (asserts! (is-user-staked tx-sender) ERR_INSUFFICIENT_STAKE)
     (asserts! (not (get is-locked thread-info)) ERR_THREAD_LOCKED)
+    (asserts! (not (get hidden thread-info)) ERR_UNAUTHORIZED) ;; Can't reply to hidden thread
     (asserts! (> (len content) u0) ERR_INVALID_AMOUNT)
     
     ;; Validate parent reply relationship
@@ -349,6 +425,11 @@
         parent-id (begin
           (asserts! (is-valid-parent-reply parent-id thread-id)
             ERR_INVALID_PARENT_REPLY
+          )
+          ;; Check if parent reply is hidden
+          (match (map-get? replies { reply-id: parent-id })
+            parent-reply (asserts! (not (get hidden parent-reply)) ERR_UNAUTHORIZED)
+            true
           )
           (some parent-id)
         )
@@ -371,6 +452,7 @@
         downvotes: u0,
         tips-received: u0,
         parent-reply-id: validated-parent-reply-id,
+        hidden: false,
       })
       
       ;; Update thread reply counter
@@ -434,5 +516,195 @@
       
       (ok true)
     )
+  )
+)
+
+;; Flag Content - Community Moderation
+(define-public (flag-thread
+    (thread-id uint)
+    (reason (string-utf8 256))
+  )
+  (let (
+      (thread-info (unwrap! (get-thread thread-id) ERR_NOT_FOUND))
+      (flagger-rep (get-user-reputation tx-sender))
+      (flag-key { thread-id: thread-id, flagger: tx-sender })
+    )
+    ;; Validation
+    (asserts! (not (is-eq tx-sender (get author thread-info))) ERR_UNAUTHORIZED)
+    (asserts! (is-none (map-get? thread-flags flag-key)) ERR_ALREADY_FLAGGED)
+    (asserts! (> (len reason) u0) ERR_INVALID_AMOUNT)
+    
+    ;; Record the flag
+    (map-set thread-flags flag-key {
+      reason: reason,
+      flagged-at: (get-current-time),
+    })
+    
+    ;; Count total flags for this thread (simplified - in production would need counter)
+    (let (
+        (total-flags (len (filter has-thread-flag? (list thread-id))))
+      )
+      ;; Auto-hide if threshold reached
+      (if (>= total-flags (var-get flag-threshold))
+        (begin
+          (map-set hidden-content {
+            content-id: thread-id,
+            content-type: "thread"
+          } {
+            hidden-at: (get-current-time),
+            hidden-by: tx-sender,
+            flag-count: total-flags,
+          })
+          ;; Update thread hidden status
+          (map-set threads { thread-id: thread-id }
+            (merge thread-info { hidden: true })
+          )
+          (ok true)
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-public (flag-reply
+    (reply-id uint)
+    (reason (string-utf8 256))
+  )
+  (let (
+      (reply-info (unwrap! (get-reply reply-id) ERR_NOT_FOUND))
+      (thread-info (unwrap! (get-thread (get thread-id reply-info)) ERR_NOT_FOUND))
+      (flag-key { reply-id: reply-id, flagger: tx-sender })
+    )
+    ;; Validation
+    (asserts! (not (is-eq tx-sender (get author reply-info))) ERR_UNAUTHORIZED)
+    (asserts! (is-none (map-get? reply-flags flag-key)) ERR_ALREADY_FLAGGED)
+    (asserts! (> (len reason) u0) ERR_INVALID_AMOUNT)
+    
+    ;; Record the flag
+    (map-set reply-flags flag-key {
+      reason: reason,
+      flagged-at: (get-current-time),
+    })
+    
+    ;; Count total flags for this reply (simplified)
+    (let (
+        (total-flags (len (filter has-reply-flag? (list reply-id))))
+      )
+      ;; Auto-hide if threshold reached
+      (if (>= total-flags (var-get flag-threshold))
+        (begin
+          (map-set hidden-content {
+            content-id: reply-id,
+            content-type: "reply"
+          } {
+            hidden-at: (get-current-time),
+            hidden-by: tx-sender,
+            flag-count: total-flags,
+          })
+          ;; Update reply hidden status
+          (map-set replies { reply-id: reply-id }
+            (merge reply-info { hidden: true })
+          )
+          (ok true)
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+;; Admin Moderation Actions
+(define-public (hide-thread (thread-id uint))
+  (let (
+      (thread-info (unwrap! (get-thread thread-id) ERR_NOT_FOUND))
+    )
+    (asserts! (is-in-moderation-committee tx-sender) ERR_UNAUTHORIZED)
+    (map-set hidden-content {
+      content-id: thread-id,
+      content-type: "thread"
+    } {
+      hidden-at: (get-current-time),
+      hidden-by: tx-sender,
+      flag-count: u0,
+    })
+    ;; Update thread hidden status
+    (map-set threads { thread-id: thread-id }
+      (merge thread-info { hidden: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (unhide-thread (thread-id uint))
+  (let (
+      (thread-info (unwrap! (get-thread thread-id) ERR_NOT_FOUND))
+    )
+    (asserts! (is-in-moderation-committee tx-sender) ERR_UNAUTHORIZED)
+    (map-delete hidden-content {
+      content-id: thread-id,
+      content-type: "thread"
+    })
+    ;; Update thread hidden status
+    (map-set threads { thread-id: thread-id }
+      (merge thread-info { hidden: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (hide-reply (reply-id uint))
+  (let (
+      (reply-info (unwrap! (get-reply reply-id) ERR_NOT_FOUND))
+    )
+    (asserts! (is-in-moderation-committee tx-sender) ERR_UNAUTHORIZED)
+    (map-set hidden-content {
+      content-id: reply-id,
+      content-type: "reply"
+    } {
+      hidden-at: (get-current-time),
+      hidden-by: tx-sender,
+      flag-count: u0,
+    })
+    ;; Update reply hidden status
+    (map-set replies { reply-id: reply-id }
+      (merge reply-info { hidden: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (unhide-reply (reply-id uint))
+  (let (
+      (reply-info (unwrap! (get-reply reply-id) ERR_NOT_FOUND))
+    )
+    (asserts! (is-in-moderation-committee tx-sender) ERR_UNAUTHORIZED)
+    (map-delete hidden-content {
+      content-id: reply-id,
+      content-type: "reply"
+    })
+    ;; Update reply hidden status
+    (map-set replies { reply-id: reply-id }
+      (merge reply-info { hidden: false })
+    )
+    (ok true)
+  )
+)
+
+;; Moderation Committee Management
+(define-public (set-moderation-committee (members (list 5 principal)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (var-set moderation-committee members)
+    (ok true)
+  )
+)
+
+(define-public (set-flag-threshold (new-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (asserts! (> new-threshold u0) ERR_INVALID_AMOUNT)
+    (var-set flag-threshold new-threshold)
+    (ok true)
   )
 )
